@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "dt295_routes.h"
 #include "transport.h"
 
@@ -30,6 +30,7 @@ typedef struct {
 typedef struct {
     uint8_t tid, used;
     uint16_t pid, ext;
+    uint32_t generation;
     section_set committed, pending;
     uint8_t previous_version, have_previous;
 } table_state;
@@ -54,6 +55,7 @@ struct dt295_routes {
     dt295_pat_program programs[64];
     uint16_t program_count, tsid;
     uint8_t have_pat, have_cat, satellite;
+    uint32_t pat_generation, cat_generation;
     pmt_info pmts[64];
     uint16_t pmt_count;
     uint16_t network_pid[64];
@@ -69,6 +71,19 @@ static uint16_t be16(const uint8_t *p) {
 static uint16_t pid13(const uint8_t *p) {
     return (uint16_t)(((p[0] & 0x1fu) << 8) | p[1]);
 }
+
+/* DT295 already descrambles internally for our setup, so a PID shared by
+ * several programs with different ECM bindings is not a decoding hazard.
+ * Allow it only when explicitly requested (CS multiplexes do this). */
+static int allow_ecm_conflict(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DT295_ALLOW_ECM_CONFLICT");
+        cached = v && *v && *v != '0';
+    }
+    return cached;
+}
+
 static void errset(char dst[DT295_ROUTE_ERROR], const char *s) {
     if (dst) {
         (void)snprintf(dst, DT295_ROUTE_ERROR, "%s", s);
@@ -158,11 +173,13 @@ static int ca_descriptors(const uint8_t *p, size_t n, uint16_t *ecm, uint16_t *a
                         return -2;
                     all[(*all_n)++] = pid;
                 }
-                if (tag == 0x09 && system == 0x0005) {
-                    if (*ecm && *ecm != pid)
-                        return -3;
-                    *ecm = pid;
-                }
+            }
+            if (tag == 0x09 && system == 0x0005) {
+                if (*ecm && *ecm != pid)
+                    return -3;
+                /* Retain 0x1fff until inheritance is resolved: an explicit
+                 * non-scrambled ES must not inherit the program ECM. */
+                *ecm = pid;
             }
         }
         i += (size_t)len + 2;
@@ -335,6 +352,7 @@ static int parse_pmt(dt295_routes *r, uint16_t pid, uint16_t program, const sect
                 if (out.stream[ix].pid == espid)
                     break;
             uint16_t binding = explicit_ecm ? explicit_ecm : out.program_ecm;
+            if (binding == 0x1fff) binding = 0;
             if (ix < out.streams) {
                 if (out.stream[ix].type != type || out.stream[ix].ecm_pid != binding)
                     return -1;
@@ -348,6 +366,7 @@ static int parse_pmt(dt295_routes *r, uint16_t pid, uint16_t program, const sect
     }
     if (!have_pcr)
         return -1;
+    if (out.program_ecm == 0x1fff) out.program_ecm = 0;
     out.ca_count = (uint16_t)allca_n;
     memcpy(out.ca_pid, allca, allca_n * sizeof(allca[0]));
     pmt_info *old = pmt_for_program(r, program);
@@ -383,6 +402,11 @@ static void apply_complete(dt295_routes *r, table_state *t) {
     t->have_previous = t->committed.valid;
     t->committed = t->pending;
     t->committed.valid = 1;
+    t->generation++;
+    if (t->tid == 0)
+        r->pat_generation++;
+    else if (t->tid == 1)
+        r->cat_generation++;
     memset(&t->pending, 0, sizeof(t->pending));
 }
 
@@ -425,6 +449,18 @@ static void section_bytes(dt295_routes *r, uint16_t pid, const uint8_t *b, size_
         section_set *c = &t->committed;
         if (number > c->last || c->length[number] != n || memcmp(c->data[number], b, n)) {
             r->invalid_sections++;
+            /* The receiver can rewrite a section without bumping the version
+             * (the on-board transcoder does this when its output stream type
+             * changes at startup). The newer bytes are authoritative: adopt
+             * them and re-parse instead of failing closed, otherwise every
+             * later copy mismatches and the session never recovers.
+             * Only PMT, whose parser updates the existing entry in place. */
+            if (t->tid == 2 && number <= c->last && n <= SECTION_MAX) {
+                memcpy(c->data[number], b, n);
+                c->length[number] = (uint16_t)n;
+                if (!parse_pmt(r, t->pid, t->ext, c))
+                    return;
+            }
             /* Same-version content changes make the committed route map stale. */
             r->unsupported_tables++;
         }
@@ -588,10 +624,31 @@ void dt295_routes_snapshot_get(const dt295_routes *r, dt295_routes_snapshot *s) 
     s->have_pat = r->have_pat;
     s->have_cat = r->have_cat;
     s->tsid = r->tsid;
+    s->pat_generation = r->pat_generation;
+    s->cat_generation = r->cat_generation;
     s->program_count = r->program_count;
     memcpy(s->programs, r->programs, r->program_count * sizeof(r->programs[0]));
+    for (unsigned i = 0; i < r->program_count; ++i) {
+        for (unsigned j = 0; j < TABLE_LIMIT; ++j) {
+            const table_state *t = &r->table[j];
+            if (t->used && t->tid == 2 && t->pid == r->programs[i].pmt_pid &&
+                t->ext == r->programs[i].program && t->committed.valid) {
+                s->pmt_present[i] = 1;
+                s->pmt_version[i] = t->committed.version;
+                s->pmt_generation[i] = t->generation;
+                break;
+            }
+        }
+    }
+    for (unsigned i = 0; i < TABLE_LIMIT; ++i) {
+        const table_state *t = &r->table[i];
+        if (t->used && t->tid == 1 && t->committed.valid) {
+            s->cat_version_valid = 1;
+            s->cat_version = t->committed.version;
+        }
+    }
     s->missing_pmts = r->program_count > r->pmt_count ? r->program_count - r->pmt_count : 0;
-    s->ready = r->have_pat && (r->satellite || r->have_cat) && s->missing_pmts == 0;
+    s->ready = r->have_pat && s->missing_pmts == 0;
     s->invalid_sections = r->invalid_sections;
     s->continuity_errors = r->continuity_errors;
     s->unsupported_tables = r->unsupported_tables;
@@ -921,6 +978,10 @@ int dt295_routes_build(const dt295_routes *r, uint16_t primary, const dt295_rout
     }
     /* Dedicated roles are logical aliases; a shared PID gets one hardware slot. */
     if (primary_pmt) {
+        p.primary_has_ecm_dependency = primary_pmt->program_ecm != 0;
+        for (unsigned i = 0; i < primary_pmt->streams; ++i)
+            if (primary_pmt->stream[i].ecm_pid)
+                p.primary_has_ecm_dependency = 1;
         uint16_t vp = 0, ap = 0;
         uint8_t vt = 0, at = 0;
         for (unsigned i = 0; i < primary_pmt->streams; ++i) {
@@ -968,10 +1029,13 @@ int dt295_routes_build(const dt295_routes *r, uint16_t primary, const dt295_rout
                         return -1;
                     }
                     if (binding && binding != (uint16_t)es) {
-                        errset(error, "shared PID has conflicting ECM bindings");
-                        return -1;
+                        if (!allow_ecm_conflict()) {
+                            errset(error, "shared PID has conflicting ECM bindings");
+                            return -1;
+                        }
+                    } else {
+                        binding = (uint16_t)es;
                     }
-                    binding = (uint16_t)es;
                 }
         if (add_general(&p, pid, binding, 0)) {
             errset(error, "PID slot capacity exceeded or conflicting ECM binding");
@@ -988,14 +1052,20 @@ int dt295_routes_build(const dt295_routes *r, uint16_t primary, const dt295_rout
             if (r->pmts[j].stream[k].ecm_pid)
                 binding = (uint16_t)plan_find_pid(&p, r->pmts[j].stream[k].ecm_pid);
             dt295_route *existing = &p.routes[s];
-            if (existing->is_ecm || (existing->ecm_slot && existing->ecm_slot != binding)) {
+            if (existing->is_ecm) {
                 errset(error, "live PID ECM rebind is unverified");
                 return -1;
             }
-            if (!existing->ecm_slot && binding)
+            if (existing->ecm_slot && existing->ecm_slot != binding) {
+                if (!allow_ecm_conflict()) {
+                    errset(error, "live PID ECM rebind is unverified");
+                    return -1;
+                }
+            } else if (!existing->ecm_slot && binding) {
                 existing->ecm_slot = binding;
+            }
         }
-    p.ready = (r->satellite || r->have_cat) && p.missing_pmts == 0;
+    p.ready = p.missing_pmts == 0;
     if (error)
         error[0] = 0;
     *desired = p;

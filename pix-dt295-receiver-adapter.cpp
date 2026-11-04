@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "pix-dt295-receiver-adapter.h"
 
 #include <libusb.h>
@@ -44,6 +44,16 @@ unsigned channel_for_hz(std::uint64_t hz) noexcept
 std::uint64_t center_for_channel(unsigned channel) noexcept
 {
     return kFirstCenterHz + (channel - kFirstChannel) * kChannelSpacingHz;
+}
+
+bool primary_order_resolved(const dt295_routes_snapshot& snapshot,
+                            std::uint16_t primary) noexcept
+{
+    for (unsigned i = 0U; i < snapshot.program_count; ++i) {
+        if (snapshot.programs[i].program == primary) return true;
+        if (!snapshot.pmt_present[i]) return false;
+    }
+    return true;
 }
 
 bool same_identity(const dtv::userland::detail::Attachment& left,
@@ -455,6 +465,11 @@ dtv::userland::Result<TuneProgramming> ReceiverAdapter::program_hz(
     tuned_system_.store(system, std::memory_order_release);
     std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
     plan_complete_ = false;
+    plan_started_ = false;
+    plan_tsid_valid_ = false;
+    plan_tsid_ = 0U;
+    plan_initial_snapshot_valid_ = false;
+    plan_initial_snapshot_ = {};
     std::memset(&live_, 0, sizeof(live_));
     dt295_routes_reset(routes_);
     dt295_routes_set_satellite(routes_, system == ReceiverSystem::satellite ? 1 : 0);
@@ -642,6 +657,17 @@ ReceiverAdapter::Result ReceiverAdapter::close(ReceiverId receiver) noexcept
     {
         std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
         dt295_card_invalidate_observation(device_);
+        // A closed receiver has no pump to renew its authenticated session.
+        // Return to unauthenticated idle so the next open authenticates again.
+        if (!recovery_failed_ && device_ != nullptr && dt295_has_session(device_)) {
+            char error[256]{};
+            if (dt295_shutdown(device_, error, sizeof(error)) != 0) {
+                recovery_failed_ = true;
+                std::fprintf(stderr, "DT295 close session shutdown failed: %s\n", error);
+                return Result::failure(Error::USB_IO);
+            }
+            key_retained_ = false;
+        }
         opened_ = false;
     }
     satellite_tuned_ = false;
@@ -807,7 +833,8 @@ ReceiverAdapter::Result ReceiverAdapter::start_stream_unlocked() noexcept
 }
 
 ReceiverAdapter::Result ReceiverAdapter::apply_plan_unlocked(
-    dt295_route_plan* current, const dt295_route_plan* desired, bool live_policy) noexcept
+    dt295_route_plan* current, const dt295_route_plan* desired, bool live_policy,
+    const dt295_routes_snapshot* snapshot) noexcept
 {
     if (current == nullptr || desired == nullptr || device_ == nullptr)
         return Result::failure(Error::DISCONNECTED);
@@ -820,8 +847,13 @@ ReceiverAdapter::Result ReceiverAdapter::apply_plan_unlocked(
     char policy_error[256]{};
     if (live_policy &&
         live_additions_only(current, &effective, ops, count, policy_error,
-                            sizeof(policy_error)) != 0)
+                            sizeof(policy_error)) != 0 &&
+        (plan_complete_ || !plan_initial_snapshot_valid_ || snapshot == nullptr ||
+         live_initial_pmt_completion_only(&plan_initial_snapshot_, snapshot, current,
+                                          &effective, ops, count, policy_error,
+                                          sizeof(policy_error)) != 0)) {
         return Result::failure(Error::UNSUPPORTED);
+    }
     if (!live_policy && count == 0U) return Result::success();
     dt295_route_plan candidate{};
     if (dt295_routes_guard(current, ops, count, &candidate, route_error) != 0)
@@ -838,6 +870,7 @@ ReceiverAdapter::Result ReceiverAdapter::apply_plan_unlocked(
     candidate.has_primary = effective.has_primary;
     candidate.video_stream_type = effective.video_stream_type;
     candidate.audio_stream_type = effective.audio_stream_type;
+    candidate.primary_has_ecm_dependency = effective.primary_has_ecm_dependency;
     std::memcpy(candidate.dedicated_pid, effective.dedicated_pid,
                 sizeof(candidate.dedicated_pid));
     dt295_routes_commit(current, &candidate);
@@ -870,7 +903,13 @@ ReceiverAdapter::Result ReceiverAdapter::ensure_streaming() noexcept
     }
     streaming_ = true;
     plan_complete_ = false;
+    plan_started_ = false;
+    plan_tsid_valid_ = false;
+    plan_tsid_ = 0U;
+    plan_initial_snapshot_valid_ = false;
+    plan_initial_snapshot_ = {};
     pump_error_.store(0, std::memory_order_release);
+    deadline_timeout_pending_.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> view_lock(acquisition_view_mutex_);
         acquisition_failure_.store(AcquisitionFailure::none, std::memory_order_release);
@@ -907,6 +946,9 @@ void ReceiverAdapter::fail_acquisition(AcquisitionFailure failure,
         acquisition_failure_.store(failure, std::memory_order_release);
         acquisition_phase_.store(AcquisitionPhase::terminal, std::memory_order_release);
         pump_error_.store(static_cast<int>(error), std::memory_order_release);
+        deadline_timeout_pending_.store(
+            failure == AcquisitionFailure::deadline && error == Error::TIMEOUT,
+            std::memory_order_release);
     }
     end_session_for_acquisition(terminal);
 }
@@ -919,7 +961,7 @@ void ReceiverAdapter::pump() noexcept
     residue.reserve(65536U + 188U);
     std::vector<std::uint8_t> publish_buffer;
     publish_buffer.reserve(65536U + 188U);
-    std::uint8_t chunk[65536U];
+    std::uint8_t* chunk = pump_chunk_.data();
     std::uint64_t last_renew = clock_.monotonic_ms();
     const std::uint64_t generation = acquisition_generation_.load(std::memory_order_acquire);
     const std::uint64_t tune_generation =
@@ -952,7 +994,7 @@ void ReceiverAdapter::pump() noexcept
         }
         std::uint64_t sequence = 0U;
         std::uint64_t completed_ns = 0U;
-        const int count = dt295_stream_read(stream_, chunk, sizeof(chunk), &sequence,
+        const int count = dt295_stream_read(stream_, chunk, pump_chunk_.size(), &sequence,
                                             &completed_ns, 50U);
         if (count < 0) {
             if (count == DT295_STREAM_ABANDONED || count == DT295_STREAM_CLOSED) break;
@@ -1113,29 +1155,22 @@ void ReceiverAdapter::pump() noexcept
                                  applied.error());
                 break;
             }
-            if (!publish_buffer.empty()) {
-                std::lock_guard<std::mutex> lock(session_.mutex);
-                if (stream_attached_ && session_.attached &&
-                    session_.terminal == dtv::userland::detail::StreamTerminal::none &&
-                    session_.incarnation == attachment_incarnation_ &&
-                    same_identity(session_.identity, attachment_)) {
-                    for (std::size_t at = 0U; at + 188U <= publish_buffer.size(); at += 188U) {
-                        session_.append_locked(dtv::userland::ByteView{
-                            publish_buffer.data() + at, 188U});
-                        if (session_.terminal != dtv::userland::detail::StreamTerminal::none) {
-                            terminal = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            publish_buffer.clear();
-            if (terminal) break;
         }
 
         if (!scan_mode && !plan_complete_ && count > 0) {
             dt295_routes_snapshot snapshot{};
             dt295_routes_snapshot_get(routes_, &snapshot);
+            if (plan_started_ && plan_tsid_valid_ && snapshot.have_pat &&
+                snapshot.tsid != plan_tsid_) {
+                std::fprintf(stderr,
+                             "DT295 acquisition plan terminal: PAT TSID changed during partial plan (%u -> %u)\n",
+                             static_cast<unsigned>(plan_tsid_),
+                             static_cast<unsigned>(snapshot.tsid));
+                fail_acquisition(AcquisitionFailure::unsupported,
+                                 dtv::userland::detail::StreamTerminal::bridge_fatal,
+                                 Error::UNSUPPORTED);
+                break;
+            }
             if (tuned_system_.load(std::memory_order_acquire) == ReceiverSystem::satellite &&
                 satellite_tsid_valid_.load(std::memory_order_acquire) &&
                 snapshot.have_pat &&
@@ -1151,7 +1186,137 @@ void ReceiverAdapter::pump() noexcept
                                  Error::UNSUPPORTED);
                 break;
             }
-            if (!snapshot.ready && snapshot.have_pat) {
+            const bool may_plan = snapshot.have_pat &&
+                                  (snapshot.ready || tuned_system_.load(std::memory_order_acquire) ==
+                                                         ReceiverSystem::satellite || snapshot.have_cat);
+            bool planned = false;
+            if (may_plan) {
+                dt295_route_plan plan{};
+                char route_error[DT295_ROUTE_ERROR]{};
+                if (dt295_routes_build(routes_, 0U, plan_started_ ? &live_ : nullptr,
+                                       &plan, route_error) != 0) {
+                    fail_acquisition(AcquisitionFailure::plan,
+                                     dtv::userland::detail::StreamTerminal::bridge_fatal,
+                                     Error::INTERNAL);
+                    break;
+                }
+                const bool primary_order_ready =
+                    !plan.has_primary || plan_started_ || snapshot.ready ||
+                    primary_order_resolved(snapshot, plan.primary_program);
+                if (plan.has_primary && primary_order_ready) {
+                    if (!plan_started_) {
+                        if (!dt295_initial_ecm_gate_allowed(&plan, snapshot.invalid_sections)) {
+                            fail_acquisition(AcquisitionFailure::multiple_ecm,
+                                             dtv::userland::detail::StreamTerminal::bridge_fatal,
+                                             Error::UNSUPPORTED);
+                            break;
+                        }
+                        if (!acquisition_alive()) break;
+                        char error[256]{};
+                        size_t drained = 0U;
+                        bool stopped = true;
+                        {
+                            std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
+                            stopped = dt295_stop(device_, &drained, error, sizeof(error)) == 0;
+                        }
+                        if (!stopped) {
+                            fail_acquisition(AcquisitionFailure::usb,
+                                             dtv::userland::detail::StreamTerminal::usb_error,
+                                             Error::USB_IO);
+                            break;
+                        }
+                        if (!acquisition_alive()) break;
+                        const auto halted = halt_unlocked();
+                        if (!halted) {
+                            fail_acquisition(AcquisitionFailure::usb,
+                                             dtv::userland::detail::StreamTerminal::usb_error,
+                                             halted.error());
+                            break;
+                        }
+                        if (!acquisition_alive()) break;
+                        bool prepared = false;
+                        {
+                            std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
+                            prepared = dt295_reprepare_plan(device_, &plan, error, sizeof(error)) == 0;
+                        }
+                        if (!prepared) {
+                            fail_acquisition(AcquisitionFailure::usb,
+                                             dtv::userland::detail::StreamTerminal::usb_error,
+                                             Error::USB_IO);
+                            break;
+                        }
+                        if (!acquisition_alive()) break;
+                        bool started_device = false;
+                        {
+                            std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
+                            started_device = dt295_start(device_, error, sizeof(error)) == 0;
+                        }
+                        if (!started_device) {
+                            fail_acquisition(AcquisitionFailure::usb,
+                                             dtv::userland::detail::StreamTerminal::usb_error,
+                                             Error::USB_IO);
+                            break;
+                        }
+                        if (!acquisition_alive()) break;
+                        const auto restarted = start_stream_unlocked();
+                        if (!restarted) {
+                            fail_acquisition(AcquisitionFailure::usb,
+                                             dtv::userland::detail::StreamTerminal::usb_error,
+                                             restarted.error());
+                            break;
+                        }
+                        {
+                            std::lock_guard<std::mutex> view_lock(acquisition_view_mutex_);
+                            if (!acquisition_alive()) break;
+                            live_ = plan;
+                            plan_started_ = true;
+                            plan_complete_ = snapshot.ready;
+                            plan_tsid_ = snapshot.tsid;
+                            plan_tsid_valid_ = snapshot.have_pat;
+                            plan_initial_snapshot_ = snapshot;
+                            plan_initial_snapshot_valid_ = !snapshot.ready;
+                            residue.clear();
+                            plan_generation_.fetch_add(1U, std::memory_order_acq_rel);
+                            acquisition_phase_.store(AcquisitionPhase::ready,
+                                                     std::memory_order_release);
+                        }
+                        std::fprintf(stderr,
+                                     "DT295 acquisition plan started: state=%s missing_pmts=%u\n",
+                                     snapshot.ready ? "complete" : "partial",
+                                     static_cast<unsigned>(plan.missing_pmts));
+                    } else if (plan_started_) {
+                        Result applied = Result::success();
+                        {
+                            std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
+                            applied = apply_plan_unlocked(&live_, &plan, true, &snapshot);
+                        }
+                        if (!applied) {
+                            fail_acquisition(applied.error() == Error::UNSUPPORTED
+                                                 ? AcquisitionFailure::plan
+                                                 : AcquisitionFailure::usb,
+                                             applied.error() == Error::UNSUPPORTED
+                                                 ? dtv::userland::detail::StreamTerminal::bridge_fatal
+                                                 : dtv::userland::detail::StreamTerminal::usb_error,
+                                             applied.error());
+                            break;
+                        }
+                        if (snapshot.ready && !plan_complete_) {
+                            plan_complete_ = true;
+                            plan_initial_snapshot_valid_ = false;
+                            std::fprintf(stderr,
+                                         "DT295 acquisition plan complete: missing_pmts=%u\n",
+                                         static_cast<unsigned>(plan.missing_pmts));
+                        }
+                    }
+                    planned = true;
+                } else if (snapshot.ready) {
+                    fail_acquisition(AcquisitionFailure::plan,
+                                     dtv::userland::detail::StreamTerminal::bridge_fatal,
+                                     Error::INTERNAL);
+                    break;
+                }
+            }
+            if (!planned && !snapshot.ready && snapshot.have_pat) {
                 dt295_route_plan bootstrap{};
                 char route_error[DT295_ROUTE_ERROR]{};
                 if (dt295_routes_bootstrap_plan(routes_, &live_, &bootstrap, route_error) != 0) {
@@ -1173,89 +1338,25 @@ void ReceiverAdapter::pump() noexcept
                     break;
                 }
             }
-            if (snapshot.ready) {
-                dt295_route_plan plan{};
-                char route_error[DT295_ROUTE_ERROR]{};
-                if (dt295_routes_build(routes_, 0U, nullptr, &plan, route_error) != 0) {
-                    fail_acquisition(AcquisitionFailure::plan,
-                                     dtv::userland::detail::StreamTerminal::bridge_fatal,
-                                     Error::INTERNAL);
-                    break;
-                }
-                unsigned ecms = 0U;
-                for (unsigned i = 0U; i < DT295_SLOT_COUNT; ++i)
-                    if (plan.routes[i].enabled && plan.routes[i].is_ecm) ++ecms;
-                if (ecms > 1U) {
-                    fail_acquisition(AcquisitionFailure::multiple_ecm,
-                                     dtv::userland::detail::StreamTerminal::bridge_fatal,
-                                     Error::UNSUPPORTED);
-                    break;
-                }
-                if (!acquisition_preparing()) break;
-                char error[256]{};
-                size_t drained = 0U;
-                bool stopped = true;
-                {
-                    std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
-                    stopped = dt295_stop(device_, &drained, error, sizeof(error)) == 0;
-                }
-                if (!stopped) {
-                    fail_acquisition(AcquisitionFailure::usb,
-                                     dtv::userland::detail::StreamTerminal::usb_error,
-                                     Error::USB_IO);
-                    break;
-                }
-                if (!acquisition_preparing()) break;
-                const auto halted = halt_unlocked();
-                if (!halted) {
-                    fail_acquisition(AcquisitionFailure::usb,
-                                     dtv::userland::detail::StreamTerminal::usb_error,
-                                     halted.error());
-                    break;
-                }
-                if (!acquisition_preparing()) break;
-                bool prepared = false;
-                {
-                    std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
-                    prepared = dt295_reprepare_plan(device_, &plan, error, sizeof(error)) == 0;
-                }
-                if (!prepared) {
-                    fail_acquisition(AcquisitionFailure::usb,
-                                     dtv::userland::detail::StreamTerminal::usb_error,
-                                     Error::USB_IO);
-                    break;
-                }
-                if (!acquisition_preparing()) break;
-                bool started_device = false;
-                {
-                    std::lock_guard<std::mutex> protocol_lock(protocol_mutex_);
-                    started_device = dt295_start(device_, error, sizeof(error)) == 0;
-                }
-                if (!started_device) {
-                    fail_acquisition(AcquisitionFailure::usb,
-                                     dtv::userland::detail::StreamTerminal::usb_error,
-                                     Error::USB_IO);
-                    break;
-                }
-                if (!acquisition_preparing()) break;
-                const auto restarted = start_stream_unlocked();
-                if (!restarted) {
-                    fail_acquisition(AcquisitionFailure::usb,
-                                     dtv::userland::detail::StreamTerminal::usb_error,
-                                     restarted.error());
-                    break;
-                }
-                {
-                    std::lock_guard<std::mutex> view_lock(acquisition_view_mutex_);
-                    if (!acquisition_preparing()) break;
-                    live_ = plan;
-                    plan_complete_ = true;
-                    residue.clear();
-                    plan_generation_.fetch_add(1U, std::memory_order_acq_rel);
-                    acquisition_phase_.store(AcquisitionPhase::ready,
-                                             std::memory_order_release);
+        }
+
+        if (!scan_mode && plan_started_ && !publish_buffer.empty()) {
+            std::lock_guard<std::mutex> lock(session_.mutex);
+            if (stream_attached_ && session_.attached &&
+                session_.terminal == dtv::userland::detail::StreamTerminal::none &&
+                session_.incarnation == attachment_incarnation_ &&
+                same_identity(session_.identity, attachment_)) {
+                for (std::size_t at = 0U; at + 188U <= publish_buffer.size(); at += 188U) {
+                    session_.append_locked(dtv::userland::ByteView{
+                        publish_buffer.data() + at, 188U});
+                    if (session_.terminal != dtv::userland::detail::StreamTerminal::none) {
+                        terminal = true;
+                        break;
+                    }
                 }
             }
+            publish_buffer.clear();
+            if (terminal) break;
         }
 
         const std::uint64_t now = clock_.monotonic_ms();
@@ -1332,6 +1433,7 @@ ReceiverAdapter::Result ReceiverAdapter::stop_attached(const Attachment& attachm
             return Result::failure(Error::INTERNAL);
         pump_joinable_ = false;
     }
+    (void)deadline_timeout_pending_.exchange(false, std::memory_order_acq_rel);
     const auto stopped = stop_receiver_unlocked();
     stream_attached_ = false;
     normal_capture_active_ = false;
@@ -1345,9 +1447,8 @@ ReceiverAdapter::Result ReceiverAdapter::stop_attached(const Attachment& attachm
         }
     }
     if (!stopped) return stopped;
-    const int pump_error = pump_error_.load(std::memory_order_acquire);
-    if (pump_error != 0 && pump_error != static_cast<int>(Error::OK))
-        return Result::failure(static_cast<Error>(pump_error));
+    // The stream terminal already carries acquisition errors. Only teardown
+    // failures belong to detach; a past pump error must not poison cleanup.
     return Result::success();
 }
 

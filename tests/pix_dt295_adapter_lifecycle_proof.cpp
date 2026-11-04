@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Offline DT295 incremental adapter lifecycle proof. */
 #include "pix-dt295-receiver-adapter.h"
 
@@ -31,6 +31,9 @@ void dt295_actual_fixture_set_bootstrap_tsid(uint16_t);
 void dt295_actual_fixture_set_card_sample(unsigned, unsigned, unsigned);
 void dt295_actual_fixture_fail_activation_once(void);
 unsigned dt295_actual_fixture_control_calls(void);
+unsigned dt295_actual_fixture_auth_requests(void);
+unsigned dt295_actual_fixture_key_requests(void);
+unsigned dt295_actual_fixture_shutdown_commands(void);
 unsigned dt295_actual_fixture_activation_failures(void);
 unsigned dt295_actual_fixture_activation_commands(void);
 unsigned dt295_actual_fixture_card_acks(void);
@@ -431,16 +434,15 @@ int main()
     std::uint8_t probe[188U]{};
     const auto probe_result = adapter.read(no_cat_t,
         dtv::userland::MutableByteView{probe, sizeof(probe)},
-        std::chrono::milliseconds(5));
+        std::chrono::milliseconds(2000));
     CHECK(probe_result);
-    CHECK(probe_result.value().bytes == 0U && probe_result.value().timed_out &&
-          !probe_result.value().eof);
+    CHECK(probe_result.value().bytes == sizeof(probe) && !probe_result.value().eof);
     CHECK(adapter.acquisition().phase ==
-          pix::capture::dt295::ReceiverAdapter::AcquisitionPhase::preparing);
+          pix::capture::dt295::ReceiverAdapter::AcquisitionPhase::ready);
     CHECK_RESULT(adapter.stop_capture(0U, ReceiverSystem::terrestrial), "no-CAT stop");
     CHECK_RESULT(adapter.detach(no_cat_t), "no-CAT detach");
     drain_attachment(adapter, no_cat_t);
-    CHECK(g_stream.generations == generations + 1U);
+    CHECK(g_stream.generations == generations + 2U);
 
     generations = g_stream.generations;
     CHECK_RESULT(adapter.program_hz(0U, ReceiverSystem::satellite, 1049480000ULL, 1000U),
@@ -463,6 +465,29 @@ int main()
     CHECK_RESULT(adapter.select_satellite_tsid(0U, 16400U, 1500U), "delayed TSID select");
     CHECK(dt295_actual_fixture_satellite_tsid() == 16400U);
     dt295_actual_fixture_set_tsid_delay(0U);
+
+    // Closing the receiver must retire the authentication that the stopped
+    // pump can no longer renew. Reopening must also acquire a fresh TS key.
+    const unsigned auth_before_close = dt295_actual_fixture_auth_requests();
+    const unsigned key_before_close = dt295_actual_fixture_key_requests();
+    const unsigned shutdown_before_close = dt295_actual_fixture_shutdown_commands();
+    CHECK_RESULT(adapter.close(0U), "close authenticated receiver");
+    CHECK(dt295_actual_fixture_shutdown_commands() == shutdown_before_close + 1U);
+    const unsigned calls_after_close = dt295_actual_fixture_control_calls();
+    CHECK_RESULT(adapter.close(0U), "repeat close");
+    CHECK(dt295_actual_fixture_control_calls() == calls_after_close);
+    CHECK_RESULT(adapter.open(0U), "reopen with fresh authentication");
+    CHECK(dt295_actual_fixture_auth_requests() == auth_before_close + 1U);
+    CHECK_RESULT(adapter.program_hz(0U, ReceiverSystem::terrestrial, 473142857ULL, 1000U),
+                 "reopened tune");
+    dt295_actual_fixture_set_bootstrap_tsid(0x1234U);
+    Attachment reopened = attachment_for(8U);
+    CHECK_RESULT(adapter.start_capture(0U, ReceiverSystem::terrestrial), "reopened start");
+    CHECK_RESULT(adapter.attach(reopened), "reopened attach");
+    CHECK(read_ts(adapter, reopened, 188U * 8U));
+    CHECK(dt295_actual_fixture_key_requests() == key_before_close + 1U);
+    CHECK_RESULT(adapter.detach(reopened), "reopened detach");
+    drain_attachment(adapter, reopened);
 
     CHECK_RESULT(adapter.close(0U), "close before fatal recovery proof");
     CHECK_RESULT(adapter.open(0U), "reopen before fatal recovery proof");

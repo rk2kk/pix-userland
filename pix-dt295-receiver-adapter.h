@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef PIX_DT295_RECEIVER_ADAPTER_H
 #define PIX_DT295_RECEIVER_ADAPTER_H
 
@@ -155,7 +155,8 @@ private:
     Result stop_receiver_unlocked() noexcept;
     Result apply_plan_unlocked(dt295_route_plan* current,
                                const dt295_route_plan* desired,
-                               bool live_policy) noexcept;
+                               bool live_policy,
+                               const dt295_routes_snapshot* snapshot = nullptr) noexcept;
     Result ensure_streaming() noexcept;
     void pump() noexcept;
     static void* pump_entry(void*) noexcept;
@@ -183,6 +184,11 @@ private:
     bool recovery_failed_ = false;
     bool streaming_ = false;
     bool plan_complete_ = false;
+    bool plan_started_ = false;
+    bool plan_tsid_valid_ = false;
+    std::uint16_t plan_tsid_ = 0U;
+    bool plan_initial_snapshot_valid_ = false;
+    dt295_routes_snapshot plan_initial_snapshot_{};
     bool key_retained_ = false;
     bool satellite_tuned_ = false;
     std::atomic<bool> satellite_tsid_valid_{false};
@@ -208,6 +214,7 @@ private:
     mutable std::mutex acquisition_view_mutex_;
     std::mutex si_mutex_;
     std::condition_variable si_changed_;
+    std::array<std::uint8_t, 65536U> pump_chunk_;
     std::vector<std::uint8_t> si_queue_;
     std::size_t si_capacity_ = 1U;
     std::size_t si_head_ = 0U;
@@ -222,6 +229,7 @@ private:
     std::uint64_t si_epoch_ = 0U;
     std::atomic<bool> pump_stop_{false};
     std::atomic<int> pump_error_{0};
+    std::atomic<bool> deadline_timeout_pending_{false};
     pthread_t pump_thread_{};
     bool pump_joinable_ = false;
 };
