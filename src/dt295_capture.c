@@ -197,10 +197,11 @@ static uint32_t pmt_crc32(const uint8_t *p, size_t n) {
     return crc;
 }
 
-static void rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
-                                  uint16_t video_pid) {
+static int rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
+                                 uint16_t video_pid) {
     if (!pmt_pid || !video_pid)
-        return;
+        return 0;
+    int rewrote = 0;
     for (size_t off = 0; off + 188 <= len; off += 188) {
         uint8_t *p = ts + off;
         if (p[0] != 0x47)
@@ -224,40 +225,32 @@ static void rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
         size_t sec_len = (size_t)(((s[1] & 0x0f) << 8) | s[2]);
         size_t total = 3 + sec_len;
         if (s[0] != 0x02 || total > slen || total < 17)
-            continue; /* 分割セクションは触らない */
-        uint8_t out[1024];
-        size_t pos = 12; /* section header + PCR + program_info */
+            continue;
+        size_t pos = 12;
         size_t entries_end = total - 4;
-        size_t w = pos;
-        memcpy(out, s, pos);
+        int changed = 0;
         while (pos + 5 <= entries_end) {
             uint8_t st = s[pos];
             uint16_t ep = (uint16_t)(((s[pos + 1] & 0x1f) << 8) | s[pos + 2]);
             size_t il = (size_t)(((s[pos + 3] & 0x0f) << 8) | s[pos + 4]);
-            size_t elen = 5 + il;
-            if (pos + elen > entries_end) {
-                w = total;
+            if (pos + 5 + il > entries_end)
                 break;
+            if (st == 0x02 && ep == video_pid) {
+                s[pos] = 0x1b;
+                changed = 1;
             }
-            if (!(st == 0x02 && ep == video_pid)) {
-                memcpy(out + w, s + pos, elen);
-                w += elen;
-            }
-            pos += elen;
+            pos += 5 + il;
         }
-        if (w >= total || w + 4 > sizeof(out))
-            continue;
-        size_t new_total = w + 4;
-        out[1] = (uint8_t)(0x30 | ((new_total - 3) >> 8));
-        out[2] = (uint8_t)((new_total - 3) & 0xff);
-        uint32_t crc = pmt_crc32(out, new_total - 4);
-        out[new_total - 4] = (uint8_t)(crc >> 24);
-        out[new_total - 3] = (uint8_t)(crc >> 16);
-        out[new_total - 2] = (uint8_t)(crc >> 8);
-        out[new_total - 1] = (uint8_t)crc;
-        memcpy(sec + 1 + ptr, out, new_total);
-        memset(sec + 1 + ptr + new_total, 0xff, plen - 1 - ptr - new_total);
+        if (changed) {
+            uint32_t crc = pmt_crc32(s, total - 4);
+            s[total - 4] = (uint8_t)(crc >> 24);
+            s[total - 3] = (uint8_t)(crc >> 16);
+            s[total - 2] = (uint8_t)(crc >> 8);
+            s[total - 1] = (uint8_t)crc;
+            rewrote = 1;
+        }
     }
+    return rewrote;
 }
 
 static int capture_status(ts_output *diag, unsigned phase, uint64_t packets, uint64_t elapsed,
@@ -818,8 +811,10 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
             record_start = last_input = now_ms();
             ts_check_init(check);
         }
-        if (emitted && rewrite_pmt_pid)
-            rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid);
+        if (emitted && rewrite_pmt_pid &&
+            rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid))
+            fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
+                    (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
             rc = output_exit(e);
             snprintf(error, sizeof(error), "TS enqueue: %s", strerror(e));
