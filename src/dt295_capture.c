@@ -197,11 +197,43 @@ static uint32_t pmt_crc32(const uint8_t *p, size_t n) {
     return crc;
 }
 
+/* 映像 PID の ES が H.264 か MPEG-2 かを見分ける (変換が乗っているかの確認)。
+ * 0x000001B3 は MPEG-2 の sequence header。H.264 の NAL (SPS/PPS/IDR/スライス/AUD/SPS) を見る。 */
+static int video_is_h264(uint8_t *ts, size_t len, uint16_t video_pid, int *state) {
+    for (size_t off = 0; off + 188 <= len; off += 188) {
+        uint8_t *p = ts + off;
+        if (p[0] != 0x47)
+            continue;
+        uint16_t pid = (uint16_t)(((p[1] & 0x1f) << 8) | p[2]);
+        if (pid != video_pid || !(p[1] & 0x40))
+            continue;
+        int afc = (p[3] >> 4) & 3;
+        size_t po = 4;
+        if (afc & 2)
+            po += 1 + p[4];
+        if (!(afc & 1) || po + 8 > 188)
+            continue;
+        uint8_t *d = p + po;
+        for (size_t i = 0; i + 4 < 188 - po; ++i) {
+            if (d[i] != 0 || d[i + 1] != 0 || d[i + 2] != 1)
+                continue;
+            uint8_t nal = d[i + 3];
+            if (nal == 0xb3)
+                *state = 0;
+            else if (nal == 0x67 || nal == 0x68 || nal == 0x65 || nal == 0x41 ||
+                     nal == 0x61 || nal == 0x09)
+                *state = 1;
+        }
+    }
+    return *state;
+}
+
 static int rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
                                  uint16_t video_pid) {
     if (!pmt_pid || !video_pid)
         return 0;
     int rewrote = 0;
+    static int seen;
     for (size_t off = 0; off + 188 <= len; off += 188) {
         uint8_t *p = ts + off;
         if (p[0] != 0x47)
@@ -209,6 +241,11 @@ static int rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
         uint16_t pid = (uint16_t)(((p[1] & 0x1f) << 8) | p[2]);
         if (pid != pmt_pid || !(p[1] & 0x40))
             continue;
+        if (!seen) {
+            seen = 1;
+            fprintf(stderr, "{\"event\":\"pmt-seen\",\"pmt\":%u,\"len\":%zu}\n",
+                    (unsigned)pmt_pid, len);
+        }
         int afc = (p[3] >> 4) & 3;
         size_t po = 4;
         if (afc & 2)
@@ -226,7 +263,8 @@ static int rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
         size_t total = 3 + sec_len;
         if (s[0] != 0x02 || total > slen || total < 17)
             continue;
-        size_t pos = 12;
+        size_t pil = (size_t)(((s[10] & 0x0f) << 8) | s[11]);
+        size_t pos = 12 + pil;
         size_t entries_end = total - 4;
         int changed = 0;
         while (pos + 5 <= entries_end) {
@@ -534,6 +572,14 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         goto done;
     }
     uint16_t rewrite_pmt_pid = 0, rewrite_video_pid = 0;
+    {
+        const char *vp = getenv("DT295_TRANSCODE_VIDEO_PID");
+        const char *pp = getenv("DT295_TRANSCODE_PMT_PID");
+        if (vp && *vp)
+            rewrite_video_pid = (uint16_t)strtoul(vp, NULL, 16);
+        if (pp && *pp)
+            rewrite_pmt_pid = (uint16_t)strtoul(pp, NULL, 16);
+    }
     uint64_t preparation_start = now_ms(), last_input = preparation_start,
              next_status = preparation_start, next_signal = preparation_start;
     uint64_t retune_t0 = 0;
@@ -771,6 +817,9 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                     (void)dt295_routes_program_pmt(tables, (uint16_t)transcode_program,
                                                    &rewrite_pmt_pid);
                 }
+                fprintf(stderr, "{\"event\":\"pmt-target\",\"program\":%lu,\"video\":%u,\"pmt\":%u}\n",
+                        transcode_program, (unsigned)rewrite_video_pid,
+                        (unsigned)rewrite_pmt_pid);
             }
             if (!dt295_initial_ecm_gate_allowed(&full, snapshot.invalid_sections) &&
                 !allow_ecm_conflict()) {
@@ -811,10 +860,14 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
             record_start = last_input = now_ms();
             ts_check_init(check);
         }
-        if (emitted && rewrite_pmt_pid &&
-            rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid))
-            fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
-                    (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
+        if (emitted && transcode_program) {
+            static int is_h264;
+            video_is_h264(out, emitted, rewrite_video_pid, &is_h264);
+            if (is_h264 && rewrite_pmt_pid &&
+                rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid))
+                fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
+                        (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
+        }
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
             rc = output_exit(e);
             snprintf(error, sizeof(error), "TS enqueue: %s", strerror(e));
