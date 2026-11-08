@@ -1692,8 +1692,13 @@ static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, 
         if (putword(d, 0x1018, program) || field(d, 0x100a, 4, 4, out_mode) ||
             field(d, 0x1136, 4, 4, pmt_mode) || field(d, 0x113a, 8, 8, 0x1b))
             return fail(d, e, en, "transcode program selection failed");
-        /* 映像 PID は PMT が揃ってから分かる。無ければプロファイルの値を残す。 */
-        if (transcode_video && putword(d, 0x1126, transcode_video))
+        /* 映像 PID は PMT が揃ってから分かる。無ければプロファイルの値を残す。
+         * DT295_TRANSCODE_VP=0 は V_PID_OUT を書かない (PMT_MODE 7 の実験用)。 */
+        uint16_t video_out = transcode_video;
+        const char *vpo = getenv("DT295_TRANSCODE_VP");
+        if (vpo && *vpo)
+            video_out = (uint16_t)strtoul(vpo, NULL, 16);
+        if (video_out && putword(d, 0x1126, video_out))
             return fail(d, e, en, "transcode program selection failed");
     }
     if (putword(d, 0x82028, 0) || command(d, 4, 0x20, 0, 0, NULL) || wait_state(d, 1, 30000))
