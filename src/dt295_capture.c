@@ -218,11 +218,18 @@ static int video_is_h264(uint8_t *ts, size_t len, uint16_t video_pid, int *state
             if (d[i] != 0 || d[i + 1] != 0 || d[i + 2] != 1)
                 continue;
             uint8_t nal = d[i + 3];
-            if (nal == 0xb3)
+            if (nal == 0xb3) {
                 *state = 0;
-            else if (nal == 0x67 || nal == 0x68 || nal == 0x65 || nal == 0x41 ||
-                     nal == 0x61 || nal == 0x09)
-                *state = 1;
+            } else if (nal == 0x67 && i + 5 < 188 - po) {
+                /* SPS。profile_idc が H.264 の既知の値のときだけ本物とみなす
+                 * (MPEG-2 の中の 00 00 01 67 を拾わない)。 */
+                uint8_t profile = d[i + 4];
+                if (profile == 66 || profile == 77 || profile == 88 || profile == 100 ||
+                    profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+                    profile == 83 || profile == 86 || profile == 118 || profile == 128 ||
+                    profile == 138 || profile == 139 || profile == 134 || profile == 135)
+                    *state = 1;
+            }
         }
     }
     return *state;
@@ -863,10 +870,15 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         if (emitted && transcode_program) {
             static int is_h264;
             video_is_h264(out, emitted, rewrite_video_pid, &is_h264);
-            if (is_h264 && rewrite_pmt_pid &&
-                rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid))
+            if (!is_h264) {
+                /* 変換が乗る (SPS が来る) までは流さない。以降は先頭から
+                 * SPS/PPS/IDR 付きで届く。 */
+                emitted = 0;
+            } else if (rewrite_pmt_pid &&
+                       rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid)) {
                 fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
                         (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
+            }
         }
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
             rc = output_exit(e);
