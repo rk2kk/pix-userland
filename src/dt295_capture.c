@@ -579,6 +579,7 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         goto done;
     }
     uint16_t rewrite_pmt_pid = 0, rewrite_video_pid = 0;
+    uint64_t transcode_deadline = 0;
     {
         const char *vp = getenv("DT295_TRANSCODE_VIDEO_PID");
         const char *pp = getenv("DT295_TRANSCODE_PMT_PID");
@@ -870,11 +871,13 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         if (emitted && transcode_program) {
             static int is_h264;
             video_is_h264(out, emitted, rewrite_video_pid, &is_h264);
-            if (!is_h264) {
-                /* 変換が乗る (SPS が来る) までは流さない。以降は先頭から
-                 * SPS/PPS/IDR 付きで届く。 */
+            if (!transcode_deadline)
+                transcode_deadline = now_ms() + 1500;
+            if (!is_h264 && now_ms() < transcode_deadline) {
+                /* 変換が乗る (SPS が来る) のを少しだけ待つ。来なければ
+                 * そのまま流す (passthrough 相当。視聴を止めない)。 */
                 emitted = 0;
-            } else if (rewrite_pmt_pid &&
+            } else if (is_h264 && rewrite_pmt_pid &&
                        rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid)) {
                 fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
                         (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
