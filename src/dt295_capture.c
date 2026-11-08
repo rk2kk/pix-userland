@@ -183,6 +183,83 @@ static void capture_message(ts_output *diag, const char *text) {
     used += 3;
     ts_output_submit(diag, line, used, NULL);
 }
+
+/* 変換対象プログラムの PMT から、残ってしまった MPEG-2 の映像エントリ
+ * (同じ PID の 0x02) を取り除く。ASIC の PMT 書き換えが二重エントリを残し、
+ * 受け側 (denpa) が MPEG-2 を掴んでしまうため (2026-11-08 の実機確認)。 */
+static uint32_t pmt_crc32(const uint8_t *p, size_t n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= (uint32_t)p[i] << 24;
+        for (int b = 0; b < 8; ++b)
+            crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : (crc << 1);
+    }
+    return crc;
+}
+
+static void rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t pmt_pid,
+                                  uint16_t video_pid) {
+    if (!pmt_pid || !video_pid)
+        return;
+    for (size_t off = 0; off + 188 <= len; off += 188) {
+        uint8_t *p = ts + off;
+        if (p[0] != 0x47)
+            continue;
+        uint16_t pid = (uint16_t)(((p[1] & 0x1f) << 8) | p[2]);
+        if (pid != pmt_pid || !(p[1] & 0x40))
+            continue;
+        int afc = (p[3] >> 4) & 3;
+        size_t po = 4;
+        if (afc & 2)
+            po += 1 + p[4];
+        if (!(afc & 1) || po + 4 > 188)
+            continue;
+        uint8_t *sec = p + po;
+        size_t plen = 188 - po;
+        size_t ptr = sec[0];
+        if (1 + ptr + 3 > plen)
+            continue;
+        uint8_t *s = sec + 1 + ptr;
+        size_t slen = plen - 1 - ptr;
+        size_t sec_len = (size_t)(((s[1] & 0x0f) << 8) | s[2]);
+        size_t total = 3 + sec_len;
+        if (s[0] != 0x02 || total > slen || total < 17)
+            continue; /* 分割セクションは触らない */
+        uint8_t out[1024];
+        size_t pos = 12; /* section header + PCR + program_info */
+        size_t entries_end = total - 4;
+        size_t w = pos;
+        memcpy(out, s, pos);
+        while (pos + 5 <= entries_end) {
+            uint8_t st = s[pos];
+            uint16_t ep = (uint16_t)(((s[pos + 1] & 0x1f) << 8) | s[pos + 2]);
+            size_t il = (size_t)(((s[pos + 3] & 0x0f) << 8) | s[pos + 4]);
+            size_t elen = 5 + il;
+            if (pos + elen > entries_end) {
+                w = total;
+                break;
+            }
+            if (!(st == 0x02 && ep == video_pid)) {
+                memcpy(out + w, s + pos, elen);
+                w += elen;
+            }
+            pos += elen;
+        }
+        if (w >= total || w + 4 > sizeof(out))
+            continue;
+        size_t new_total = w + 4;
+        out[1] = (uint8_t)(0x30 | ((new_total - 3) >> 8));
+        out[2] = (uint8_t)((new_total - 3) & 0xff);
+        uint32_t crc = pmt_crc32(out, new_total - 4);
+        out[new_total - 4] = (uint8_t)(crc >> 24);
+        out[new_total - 3] = (uint8_t)(crc >> 16);
+        out[new_total - 2] = (uint8_t)(crc >> 8);
+        out[new_total - 1] = (uint8_t)crc;
+        memcpy(sec + 1 + ptr, out, new_total);
+        memset(sec + 1 + ptr + new_total, 0xff, plen - 1 - ptr - new_total);
+    }
+}
+
 static int capture_status(ts_output *diag, unsigned phase, uint64_t packets, uint64_t elapsed,
                           uint64_t renewals, dt295_stream *stream, ts_output *output,
                           const dt295_stream_stats *final, const dt295_routes *tables) {
@@ -463,6 +540,7 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         snprintf(error, sizeof(error), "native USB start error %d", e);
         goto done;
     }
+    uint16_t rewrite_pmt_pid = 0, rewrite_video_pid = 0;
     uint64_t preparation_start = now_ms(), last_input = preparation_start,
              next_status = preparation_start, next_signal = preparation_start;
     uint64_t retune_t0 = 0;
@@ -694,8 +772,11 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
             }
             if (transcode_program) {
                 uint16_t video_pid = 0;
-                if (!dt295_routes_program_video(tables, (uint16_t)transcode_program, &video_pid))
+                if (!dt295_routes_program_video(tables, (uint16_t)transcode_program, &video_pid)) {
                     full.transcode_video = video_pid;
+                    rewrite_pmt_pid = full.dedicated_pid[2];
+                    rewrite_video_pid = video_pid;
+                }
             }
             if (!dt295_initial_ecm_gate_allowed(&full, snapshot.invalid_sections) &&
                 !allow_ecm_conflict()) {
@@ -736,6 +817,8 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
             record_start = last_input = now_ms();
             ts_check_init(check);
         }
+        if (emitted && rewrite_pmt_pid)
+            rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid);
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
             rc = output_exit(e);
             snprintf(error, sizeof(error), "TS enqueue: %s", strerror(e));
