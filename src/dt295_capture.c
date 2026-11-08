@@ -873,14 +873,23 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
             video_is_h264(out, emitted, rewrite_video_pid, &is_h264);
             if (!transcode_deadline)
                 transcode_deadline = now_ms() + 1500;
-            if (!is_h264 && now_ms() < transcode_deadline) {
-                /* 変換が乗る (SPS が来る) のを少しだけ待つ。来なければ
-                 * そのまま流す (passthrough 相当。視聴を止めない)。 */
+            static int reported = -1;
+            if (is_h264) {
+                if (reported != 1) {
+                    reported = 1;
+                    fprintf(stderr, "{\"event\":\"transcode\",\"active\":1}\n");
+                }
+                if (rewrite_pmt_pid &&
+                    rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid))
+                    fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
+                            (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
+            } else if (now_ms() < transcode_deadline) {
+                /* 変換が乗る (SPS が来る) のを少しだけ待つ。 */
                 emitted = 0;
-            } else if (is_h264 && rewrite_pmt_pid &&
-                       rewrite_transcode_pmt(out, emitted, rewrite_pmt_pid, rewrite_video_pid)) {
-                fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
-                        (unsigned)rewrite_pmt_pid, (unsigned)rewrite_video_pid);
+            } else if (reported != 0) {
+                /* 乗らなかった。受け側が再エンコードへ回れるよう知らせる。 */
+                reported = 0;
+                fprintf(stderr, "{\"event\":\"transcode\",\"active\":0}\n");
             }
         }
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
