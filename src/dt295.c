@@ -1682,9 +1682,18 @@ static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, 
      * number と、その program の映像 PID を V_PID_OUT に書く。出力モード 3
      * (H.264 変換)・PMT_MODE 4 と組で動く (実機 2026-11-08 で確認)。 */
     if (transcode_program) {
-        if (putword(d, 0x1018, program) || field(d, 0x100a, 4, 4, 3) ||
-            field(d, 0x1136, 4, 4, 4) || field(d, 0x113a, 8, 8, 0x1b) ||
-            putword(d, 0x1126, transcode_video))
+        unsigned out_mode = 3, pmt_mode = 4;
+        const char *om = getenv("DT295_TRANSCODE_OUT_MODE");
+        const char *pm = getenv("DT295_TRANSCODE_PMT_MODE");
+        if (om && *om)
+            out_mode = (unsigned)strtoul(om, NULL, 10) & 0xf;
+        if (pm && *pm)
+            pmt_mode = (unsigned)strtoul(pm, NULL, 10) & 0xf;
+        if (putword(d, 0x1018, program) || field(d, 0x100a, 4, 4, out_mode) ||
+            field(d, 0x1136, 4, 4, pmt_mode) || field(d, 0x113a, 8, 8, 0x1b))
+            return fail(d, e, en, "transcode program selection failed");
+        /* 映像 PID は PMT が揃ってから分かる。無ければプロファイルの値を残す。 */
+        if (transcode_video && putword(d, 0x1126, transcode_video))
             return fail(d, e, en, "transcode program selection failed");
     }
     if (putword(d, 0x82028, 0) || command(d, 4, 0x20, 0, 0, NULL) || wait_state(d, 1, 30000))
