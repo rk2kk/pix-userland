@@ -420,6 +420,19 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         rc = 7;
         goto done;
     }
+    /* 変換対象のサービス (CS の複数プログラムから選ぶ)。pix-ts-legacy は
+     * DT295_TRANSCODE_PROGRAM を 0x1018 と V_PID_OUT に反映する。 */
+    unsigned long transcode_program = 0;
+    {
+        const char *tp = getenv("DT295_TRANSCODE_PROGRAM");
+        char *end = NULL;
+        if (tp && *tp) {
+            transcode_program = strtoul(tp, &end, 10);
+            if (!end || *end || transcode_program > 0xFFFF)
+                transcode_program = 0;
+        }
+    }
+
     dt295_route_plan live = {0}, bootstrap;
     char route_error[DT295_ROUTE_ERROR] = {0};
     dt295_route_op initial[DT295_ROUTE_OP_LIMIT];
@@ -429,6 +442,11 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         snprintf(error, sizeof(error), "%s", route_error);
         rc = 8;
         goto done;
+    }
+    if (transcode_program) {
+        uint16_t video_pid = 0;
+        if (!dt295_routes_program_video(tables, (uint16_t)transcode_program, &video_pid))
+            bootstrap.transcode_video = video_pid;
     }
     if (dt295_prepare_plan(d, &bootstrap, error, sizeof(error))) {
         rc = 7;
@@ -673,6 +691,11 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 rc = 8;
                 snprintf(error, sizeof(error), "initial complete plan: %s", route_error);
                 break;
+            }
+            if (transcode_program) {
+                uint16_t video_pid = 0;
+                if (!dt295_routes_program_video(tables, (uint16_t)transcode_program, &video_pid))
+                    full.transcode_video = video_pid;
             }
             if (!dt295_initial_ecm_gate_allowed(&full, snapshot.invalid_sections) &&
                 !allow_ecm_conflict()) {

@@ -1567,7 +1567,8 @@ int dt295_route_write(dt295 *d, const dt295_route_op *op, char *e, size_t en) {
 }
 
 static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, uint16_t program,
-                          uint8_t video_type, uint8_t audio_type, int rearm, char *e, size_t en) {
+                          uint8_t video_type, uint8_t audio_type, uint16_t transcode_video,
+                          int rearm, char *e, size_t en) {
     if (!d || d->poisoned || d->cleanup_only || !d->has_session || !d->tuned || d->prepared || d->started ||
         (!routes && count) || count > 64 || ((rearm != 0) != !!d->has_ts_key))
         return fail(d, e, en, "receiver preparation preconditions failed");
@@ -1640,6 +1641,20 @@ static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, 
         if (set_route_fields(d, &routes[i]))
             return fail(d, e, en, "initial route apply failed");
     }
+    /* 変換対象のプログラム番号 (0x1018 PROGRAM_NUMBER)。CS のように 1 中継器へ
+     * 複数プログラムが載るとき、どのプログラムを変換するかを選ぶ。 */
+    uint16_t transcode_program = 0;
+    {
+        const char *override = getenv("DT295_TRANSCODE_PROGRAM");
+        if (override && *override) {
+            char *end = NULL;
+            unsigned long value = strtoul(override, &end, 10);
+            if (!end || *end != '\0' || value > 0xFFFF)
+                return fail(d, e, en, "DT295_TRANSCODE_PROGRAM is invalid");
+            transcode_program = (uint16_t)value;
+            program = transcode_program;
+        }
+    }
     if (putword(d, 0x1018, program) || field(d, 0x101c, 8, 8, video_type) ||
         field(d, 0x101c, 0, 8, audio_type))
         return fail(d, e, en, "program metadata apply failed");
@@ -1663,6 +1678,15 @@ static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, 
         }
     }
     /* <<< DT295_XREG2 test hook */
+    /* CS などの複数プログラムから、変換するプログラムを選ぶ。0x1018 の program
+     * number と、その program の映像 PID を V_PID_OUT に書く。出力モード 3
+     * (H.264 変換)・PMT_MODE 4 と組で動く (実機 2026-11-08 で確認)。 */
+    if (transcode_program) {
+        if (putword(d, 0x1018, program) || field(d, 0x100a, 4, 4, 3) ||
+            field(d, 0x1136, 4, 4, 4) || field(d, 0x113a, 8, 8, 0x1b) ||
+            putword(d, 0x1126, transcode_video))
+            return fail(d, e, en, "transcode program selection failed");
+    }
     if (putword(d, 0x82028, 0) || command(d, 4, 0x20, 0, 0, NULL) || wait_state(d, 1, 30000))
         return fail(d, e, en, "receive acquisition did not reach configured state");
     uint16_t dma = 0;
@@ -1683,7 +1707,7 @@ static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, 
 }
 
 int dt295_prepare(dt295 *d, const dt295_route_op *routes, size_t count, char *e, size_t en) {
-    return prepare_config(d, routes, count, 0, 0, 0, 0, e, en);
+    return prepare_config(d, routes, count, 0, 0, 0, 0, 0, e, en);
 }
 
 static int plan_to_ops(const dt295_route_plan *plan, dt295_route_op ops[64], size_t *count) {
@@ -1728,7 +1752,7 @@ int dt295_prepare_plan(dt295 *d, const dt295_route_plan *plan, char *e, size_t e
     size_t n;
     if (!plan_to_ops(plan, ops, &n))
         return prepare_config(d, ops, n, plan->primary_program, plan->video_stream_type,
-                              plan->audio_stream_type, 0, e, en);
+                              plan->audio_stream_type, plan->transcode_video, 0, e, en);
     return fail(d, e, en, "invalid validated DT295 route plan");
 }
 int dt295_reprepare_plan(dt295 *d, const dt295_route_plan *plan, char *e, size_t en) {
@@ -1739,7 +1763,7 @@ int dt295_reprepare_plan(dt295 *d, const dt295_route_plan *plan, char *e, size_t
             d, e, en,
             "reprepare requires stopped receiver, retained transport key, and valid route plan");
     return prepare_config(d, ops, n, plan->primary_program, plan->video_stream_type,
-                          plan->audio_stream_type, 1, e, en);
+                          plan->audio_stream_type, plan->transcode_video, 1, e, en);
 }
 
 int dt295_start(dt295 *d, char *e, size_t en) {

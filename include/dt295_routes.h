@@ -40,6 +40,8 @@ typedef struct {
     uint8_t primary_has_ecm_dependency;
     uint16_t primary_program;
     uint16_t missing_pmts;
+    /* 変換対象サービスの映像 PID (0 = 使わない)。CS の複数プログラムから選ぶ。 */
+    uint16_t transcode_video;
 } dt295_route_plan;
 
 typedef struct {
@@ -89,6 +91,8 @@ int dt295_routes_initial_ops(const dt295_route_plan *, dt295_route_op ops[DT295_
 int dt295_routes_plan_ops(const dt295_route_plan *current, const dt295_route_plan *desired,
                           dt295_route_op ops[DT295_ROUTE_OP_LIMIT], size_t *count,
                           char error[DT295_ROUTE_ERROR]);
+/* Find the video PID of a program in the committed PSI (0 if unknown). */
+int dt295_routes_program_video(const dt295_routes *, uint16_t program, uint16_t *pid);
 /* Validate the entire operation list before returning a candidate state. */
 int dt295_routes_guard(const dt295_route_plan *, const dt295_route_op *, size_t,
                        dt295_route_plan *candidate, char error[DT295_ROUTE_ERROR]);
