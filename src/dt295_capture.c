@@ -774,8 +774,9 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 uint16_t video_pid = 0;
                 if (!dt295_routes_program_video(tables, (uint16_t)transcode_program, &video_pid)) {
                     full.transcode_video = video_pid;
-                    rewrite_pmt_pid = full.dedicated_pid[2];
                     rewrite_video_pid = video_pid;
+                    (void)dt295_routes_program_pmt(tables, (uint16_t)transcode_program,
+                                                   &rewrite_pmt_pid);
                 }
             }
             if (!dt295_initial_ecm_gate_allowed(&full, snapshot.invalid_sections) &&

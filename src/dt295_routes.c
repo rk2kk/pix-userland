@@ -825,6 +825,16 @@ int dt295_routes_program_video(const dt295_routes *r, uint16_t program, uint16_t
     return -1;
 }
 
+int dt295_routes_program_pmt(const dt295_routes *r, uint16_t program, uint16_t *pid) {
+    if (!r || !pid)
+        return -1;
+    const pmt_info *p = pmt_for_program((dt295_routes *)r, program);
+    if (!p)
+        return -1;
+    *pid = p->pmt_pid;
+    return 0;
+}
+
 int dt295_routes_build(const dt295_routes *r, uint16_t primary, const dt295_route_plan *current,
                        dt295_route_plan *desired, char error[DT295_ROUTE_ERROR]) {
     if (!r || !desired || !r->have_pat) {

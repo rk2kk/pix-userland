@@ -1681,7 +1681,7 @@ static int prepare_config(dt295 *d, const dt295_route_op *routes, size_t count, 
     /* CS などの複数プログラムから、変換するプログラムを選ぶ。0x1018 の program
      * number と、その program の映像 PID を V_PID_OUT に書く。出力モード 3
      * (H.264 変換)・PMT_MODE 4 と組で動く (実機 2026-11-08 で確認)。 */
-    if (transcode_program) {
+    if (transcode_program && !getenv("DT295_TRANSCODE_NO_REG")) {
         unsigned out_mode = 3, pmt_mode = 4;
         const char *om = getenv("DT295_TRANSCODE_OUT_MODE");
         const char *pm = getenv("DT295_TRANSCODE_PMT_MODE");

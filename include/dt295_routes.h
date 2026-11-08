@@ -93,6 +93,7 @@ int dt295_routes_plan_ops(const dt295_route_plan *current, const dt295_route_pla
                           char error[DT295_ROUTE_ERROR]);
 /* Find the video PID of a program in the committed PSI (0 if unknown). */
 int dt295_routes_program_video(const dt295_routes *, uint16_t program, uint16_t *pid);
+int dt295_routes_program_pmt(const dt295_routes *, uint16_t program, uint16_t *pid);
 /* Validate the entire operation list before returning a candidate state. */
 int dt295_routes_guard(const dt295_route_plan *, const dt295_route_op *, size_t,
                        dt295_route_plan *candidate, char error[DT295_ROUTE_ERROR]);
