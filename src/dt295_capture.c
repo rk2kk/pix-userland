@@ -531,6 +531,7 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 recording = 0;
                 ts_check_init(check);
                 last_input = now_ms();
+                preparation_start = now_ms();
                 fprintf(stderr,
                         "{\"event\":\"tuned\",\"type\":\"%s\",\"channel\":\"%u\","
                         "\"slot\":%d}\n",
@@ -671,33 +672,46 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                          "multiple independent ECMs are outside the verified DT295 scope");
                 break;
             }
-            if (dt295_stop(d, &drained, error, sizeof(error))) {
-                rc = 7;
-                break;
+            /* まずストリームを止めずに full plan を適用してみる (高速化)。
+             * 失敗したら従来どおり stop -> reprepare -> start にフォールバック。 */
+            int live_applied = 0;
+            if (apply_plan(d, &live, &full, 0, NULL, NULL, error, sizeof(error)) == 0) {
+                live = full;
+                remainder = 0;
+                recording = 1;
+                record_start = last_input = now_ms();
+                ts_check_init(check);
+                live_applied = 1;
             }
-            if (dt295_stream_stop(u.stream, 3000) || dt295_stream_destroy(u.stream)) {
-                native_abandoned = 1;
-                rc = 7;
-                snprintf(error, sizeof(error), "bootstrap USB cancellation did not quiesce");
-                break;
+            if (!live_applied) {
+                if (dt295_stop(d, &drained, error, sizeof(error))) {
+                    rc = 7;
+                    break;
+                }
+                if (dt295_stream_stop(u.stream, 3000) || dt295_stream_destroy(u.stream)) {
+                    native_abandoned = 1;
+                    rc = 7;
+                    snprintf(error, sizeof(error), "bootstrap USB cancellation did not quiesce");
+                    break;
+                }
+                u.stream = NULL;
+                if (dt295_reprepare_plan(d, &full, error, sizeof(error)) ||
+                    dt295_start(d, error, sizeof(error))) {
+                    rc = 7;
+                    break;
+                }
+                e = dt295_stream_start(usb_native_context(u.usb), usb_native_handle(u.usb), &u.stream);
+                if (e) {
+                    rc = 7;
+                    snprintf(error, sizeof(error), "recording USB start error %d", e);
+                    break;
+                }
+                live = full;
+                remainder = 0;
+                recording = 1;
+                record_start = last_input = now_ms();
+                ts_check_init(check);
             }
-            u.stream = NULL;
-            if (dt295_reprepare_plan(d, &full, error, sizeof(error)) ||
-                dt295_start(d, error, sizeof(error))) {
-                rc = 7;
-                break;
-            }
-            e = dt295_stream_start(usb_native_context(u.usb), usb_native_handle(u.usb), &u.stream);
-            if (e) {
-                rc = 7;
-                snprintf(error, sizeof(error), "recording USB start error %d", e);
-                break;
-            }
-            live = full;
-            remainder = 0;
-            recording = 1;
-            record_start = last_input = now_ms();
-            ts_check_init(check);
         }
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
             rc = output_exit(e);
