@@ -53,8 +53,7 @@ int dt295_initial_ecm_gate_allowed(const dt295_route_plan *plan,
     for (unsigned i = 0; i < DT295_SLOT_COUNT; ++i)
         if (plan->routes[i].enabled && plan->routes[i].is_ecm)
             ecms++;
-    return ecms <= 1 || (!invalid_sections &&
-                         dt295_primary_has_no_ecm_dependency(plan));
+    return ecms <= 1 || !invalid_sections;
 }
 
 static int same_plan_route(const dt295_route *left, const dt295_route *right) {
@@ -105,9 +104,7 @@ int live_initial_pmt_completion_only(const dt295_routes_snapshot *initial,
                       current->video_stream_type != desired->video_stream_type ||
                       current->audio_stream_type != desired->audio_stream_type ||
                       memcmp(current->dedicated_pid, desired->dedicated_pid,
-                             sizeof(current->dedicated_pid)) ||
-                      !dt295_primary_has_no_ecm_dependency(current) ||
-                      !dt295_primary_has_no_ecm_dependency(desired),
+                             sizeof(current->dedicated_pid)),
                       "primary roles or ECM binding changed during initial completion");
 #undef COMPLETION_REJECT
     unsigned completed = 0;

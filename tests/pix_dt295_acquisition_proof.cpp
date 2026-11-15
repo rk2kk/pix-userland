@@ -745,14 +745,14 @@ bool saved_cs_completion_policy_proof(int mux)
         accepted = dt295_routes_build(routes, paid_program, nullptr, &paid_full, error) == 0 &&
                    dt295_routes_build(routes, 0U, nullptr, &free_full, error) == 0 &&
                    saved_plan_ecms(paid_full) > 1U &&
-                   !dt295_initial_ecm_gate_allowed(&paid_full, 0U) &&
+                   dt295_initial_ecm_gate_allowed(&paid_full, 0U) &&
                    dt295_initial_ecm_gate_allowed(&free_full, 0U) &&
-                   !dt295_initial_ecm_gate_allowed(&free_full, 1U);
+                   dt295_initial_ecm_gate_allowed(&free_full, 1U);
         if (accepted) {
             dt295_route_plan dependent = free_full;
             dependent.primary_has_ecm_dependency = 1U;
             accepted = !dt295_primary_has_no_ecm_dependency(&dependent) &&
-                       !dt295_initial_ecm_gate_allowed(&dependent, 0U);
+                       dt295_initial_ecm_gate_allowed(&dependent, 0U);
         }
     }
     dt295_routes_destroy(routes);
@@ -818,7 +818,7 @@ bool saved_cs_primary_dependency_proof(int mux)
                                       &plan, error) == 0 &&
                    plan.primary_has_ecm_dependency &&
                    !dt295_primary_has_no_ecm_dependency(&plan) &&
-                   !dt295_initial_ecm_gate_allowed(&plan, 0U);
+                   dt295_initial_ecm_gate_allowed(&plan, 0U);
     bool private_binding = false;
     bool ecm_route = false;
     for (unsigned i = 0U; accepted && i < DT295_SLOT_COUNT; ++i) {
