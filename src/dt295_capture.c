@@ -183,6 +183,188 @@ static void capture_message(ts_output *diag, const char *text) {
     used += 3;
     ts_output_submit(diag, line, used, NULL);
 }
+
+/* 変換対象の video PID を MPEG-2 (0x02) と宣言したまま残った PMT を、実態に
+ * 合わせて H.264 (0x1b) へ書き換える。ASIC の PMT 書き換えは変換対象の
+ * プログラム (0x1018 = ルートの primary) だけを直し、同じ video PID を指す
+ * 他プログラムの PMT が 0x02 のまま残るので、受け側 (denpa/ffmpeg) が
+ * MPEG-2 を掴んでしまう (2026-11-15 の T21 実機確認: PMT 257=0x1b に対し
+ * PMT 258/259 が同じ pid 273 を 0x02 と宣言)。セクションは2パケットに
+ * またがるので、寄与パケットを寄せて1つのセクションとして直す。 */
+static uint32_t pmt_crc32(const uint8_t *p, size_t n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= (uint32_t)p[i] << 24;
+        for (int b = 0; b < 8; ++b)
+            crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : (crc << 1);
+    }
+    return crc;
+}
+
+/* 映像 PID の ES が H.264 か MPEG-2 かを見分ける (変換が乗っているかの確認)。
+ * 0x000001B3 は MPEG-2 の sequence header。H.264 の SPS (NAL type 7) は
+ * profile_idc が既知の値のときだけ本物とみなす (nal_ref_idc は除く)。 */
+static int video_is_h264(uint8_t *ts, size_t len, uint16_t video_pid, int *state) {
+    for (size_t off = 0; off + 188 <= len; off += 188) {
+        uint8_t *p = ts + off;
+        if (p[0] != 0x47)
+            continue;
+        uint16_t pid = (uint16_t)(((p[1] & 0x1f) << 8) | p[2]);
+        if (pid != video_pid || !(p[1] & 0x40))
+            continue;
+        int afc = (p[3] >> 4) & 3;
+        size_t po = 4;
+        if (afc & 2)
+            po += 1 + p[4];
+        if (!(afc & 1) || po + 8 > 188)
+            continue;
+        uint8_t *d = p + po;
+        for (size_t i = 0; i + 4 < 188 - po; ++i) {
+            if (d[i] != 0 || d[i + 1] != 0 || d[i + 2] != 1)
+                continue;
+            uint8_t nal = d[i + 3];
+            if (nal == 0xb3) {
+                /* MPEG-2 の sequence header */
+                *state = 0;
+            } else if ((nal & 0x1f) == 7 && i + 5 < 188 - po) {
+                /* SPS。nal_ref_idc の bits は除く (実機は 0x27 = ref 1) */
+                uint8_t profile = d[i + 4];
+                if (profile == 66 || profile == 77 || profile == 88 || profile == 100 ||
+                    profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+                    profile == 83 || profile == 86 || profile == 118 || profile == 128 ||
+                    profile == 138 || profile == 139 || profile == 134 || profile == 135)
+                    *state = 1;
+            }
+        }
+    }
+    return *state;
+}
+
+/* 出力バッチ内のすべての PMT を走査し、video_pid を 0x02 と宣言している映像
+ * エントリを 0x1b に直して CRC を張り直す。書き換えた PMT は初回だけログに
+ * 出す (PMT は繰り返し流れるので毎回出すとログが溢れる)。 */
+static int rewrite_transcode_pmt(uint8_t *ts, size_t len, uint16_t video_pid,
+                                 uint16_t *seen_pmts, int *seen_count) {
+    if (!video_pid)
+        return 0;
+    int rewrote = 0;
+    for (size_t off = 0; off + 188 <= len; off += 188) {
+        uint8_t *p = ts + off;
+        if (p[0] != 0x47 || !(p[1] & 0x40))
+            continue;
+        uint16_t pid = (uint16_t)(((p[1] & 0x1f) << 8) | p[2]);
+        int afc = (p[3] >> 4) & 3;
+        if (afc == 2)
+            continue;
+        size_t po = 4;
+        if (afc & 2)
+            po += 1 + p[4];
+        if (!(afc & 1) || po + 4 > 188)
+            continue;
+        uint8_t *payload = p + po;
+        size_t plen = 188 - po;
+        size_t ptr = payload[0];
+        if (1 + ptr + 3 > plen)
+            continue;
+        uint8_t *s = payload + 1 + ptr;
+        size_t slen = plen - 1 - ptr;
+        if (slen < 3 || s[0] != 0x02)
+            continue;
+        size_t total = 3 + (size_t)(((s[1] & 0x0f) << 8) | s[2]);
+        if (total < 17 || total > 1024)
+            continue;
+        /* セクション全体を寄せる。T21 の PMT は2パケットにまたがる。このバッチ
+         * に収まらなければ次回の繰り返し (約100msごと) に任せる。 */
+        uint8_t sec[1024];
+        size_t have = slen < total ? slen : total;
+        memcpy(sec, s, have);
+        size_t next = off + 188;
+        while (have < total) {
+            if (next + 188 > len)
+                break;
+            uint8_t *q = ts + next;
+            if (q[0] != 0x47 || (uint16_t)(((q[1] & 0x1f) << 8) | q[2]) != pid || (q[1] & 0x40))
+                break;
+            int a2 = (q[3] >> 4) & 3;
+            if (a2 == 2)
+                break;
+            size_t po2 = 4;
+            if (a2 & 2)
+                po2 += 1 + q[4];
+            if (!(a2 & 1) || po2 > 188)
+                break;
+            size_t take = 188 - po2;
+            if (take > total - have)
+                take = total - have;
+            memcpy(sec + have, q + po2, take);
+            have += take;
+            next += 188;
+        }
+        if (have < total || sec[0] != 0x02)
+            continue;
+        /* 映像エントリ (同じ PID の 0x02) を 0x1b に。長さは変わらないので
+         * 寄せたバイト列をそのまま各パケットへ戻せる。 */
+        size_t pil = (size_t)(((sec[10] & 0x0f) << 8) | sec[11]);
+        size_t pos = 12 + pil, end = total - 4;
+        int changed = 0;
+        while (pos + 5 <= end) {
+            uint8_t st = sec[pos];
+            uint16_t ep = (uint16_t)(((sec[pos + 1] & 0x1f) << 8) | sec[pos + 2]);
+            size_t il = (size_t)(((sec[pos + 3] & 0x0f) << 8) | sec[pos + 4]);
+            if (pos + 5 + il > end)
+                break;
+            if (st == 0x02 && ep == video_pid) {
+                sec[pos] = 0x1b;
+                changed = 1;
+            }
+            pos += 5 + il;
+        }
+        if (!changed)
+            continue;
+        uint32_t crc = pmt_crc32(sec, total - 4);
+        sec[total - 4] = (uint8_t)(crc >> 24);
+        sec[total - 3] = (uint8_t)(crc >> 16);
+        sec[total - 2] = (uint8_t)(crc >> 8);
+        sec[total - 1] = (uint8_t)crc;
+        size_t wrote = slen < total ? slen : total;
+        memcpy(s, sec, wrote);
+        next = off + 188;
+        while (wrote < total) {
+            if (next + 188 > len)
+                break;
+            uint8_t *q = ts + next;
+            if (q[0] != 0x47 || (uint16_t)(((q[1] & 0x1f) << 8) | q[2]) != pid || (q[1] & 0x40))
+                break;
+            int a2 = (q[3] >> 4) & 3;
+            if (a2 == 2)
+                break;
+            size_t po2 = 4;
+            if (a2 & 2)
+                po2 += 1 + q[4];
+            if (!(a2 & 1) || po2 > 188)
+                break;
+            size_t take = 188 - po2;
+            if (take > total - wrote)
+                take = total - wrote;
+            memcpy(q + po2, sec + wrote, take);
+            wrote += take;
+            next += 188;
+        }
+        if (wrote < total)
+            continue;
+        rewrote = 1;
+        int known = 0;
+        for (int i = 0; i < *seen_count; ++i)
+            if (seen_pmts[i] == pid)
+                known = 1;
+        if (!known && *seen_count < 16) {
+            seen_pmts[(*seen_count)++] = pid;
+            fprintf(stderr, "{\"event\":\"pmt-rewrite\",\"pmt\":%u,\"video\":%u}\n",
+                    (unsigned)pid, (unsigned)video_pid);
+        }
+    }
+    return rewrote;
+}
 static int capture_status(ts_output *diag, unsigned phase, uint64_t packets, uint64_t elapsed,
                           uint64_t renewals, dt295_stream *stream, ts_output *output,
                           const dt295_stream_stats *final, const dt295_routes *tables) {
@@ -457,6 +639,11 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
     unsigned cur_channel = cfg->channel;
     int cur_slot = cfg->slot;
     pixy_system cur_system = cfg->system;
+    /* オンボード変換 (H.264) の監視状態。選局し直しで作り直す。 */
+    uint16_t tc_video = 0;
+    int tc_state = 0, tc_reported = -1, tc_seen_count = 0;
+    uint64_t tc_deadline = 0;
+    uint16_t tc_seen_pmts[16] = {0};
 
     while (!cfg->interrupted || !*cfg->interrupted) {
         if (control_on) {
@@ -529,6 +716,11 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 remainder = 0;
                 align = (ts_align){0};
                 recording = 0;
+                tc_video = 0;
+                tc_state = 0;
+                tc_reported = -1;
+                tc_deadline = 0;
+                tc_seen_count = 0;
                 ts_check_init(check);
                 last_input = now_ms();
                 preparation_start = now_ms();
@@ -712,6 +904,41 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 recording = 1;
                 record_start = last_input = now_ms();
                 ts_check_init(check);
+            }
+        }
+        /* オンボード変換の確認と、実態に合わない PMT の書き換え。ルートの主
+         * プログラムの映像が H.264 と宣言されているときだけ動く (変換中、
+         * もしく元から H.264 の局)。passthrough の MPEG-2 には一切触れない。 */
+        if (emitted && recording && desired.video_stream_type == 0x1b &&
+            desired.dedicated_pid[0]) {
+            uint16_t vpid = desired.dedicated_pid[0];
+            if (vpid != tc_video) {
+                tc_video = vpid;
+                tc_state = 0;
+                tc_reported = -1;
+                tc_deadline = 0;
+                tc_seen_count = 0;
+                fprintf(stderr,
+                        "{\"event\":\"pmt-target\",\"program\":%u,\"video\":%u,\"pmt\":%u}\n",
+                        (unsigned)desired.primary_program, (unsigned)vpid,
+                        (unsigned)desired.dedicated_pid[2]);
+            }
+            video_is_h264(out, emitted, vpid, &tc_state);
+            if (!tc_deadline)
+                tc_deadline = now_ms() + 1500;
+            if (tc_state) {
+                if (tc_reported != 1) {
+                    tc_reported = 1;
+                    fprintf(stderr, "{\"event\":\"transcode\",\"active\":1}\n");
+                }
+                (void)rewrite_transcode_pmt(out, emitted, vpid, tc_seen_pmts, &tc_seen_count);
+            } else if (now_ms() < tc_deadline) {
+                /* 変換の SPS が来るまで少し待つ (未成形の先頭を渡さない)。 */
+                emitted = 0;
+            } else if (tc_reported != 0) {
+                /* 乗らなかった。受け側が再エンコードへ回れるよう知らせる。 */
+                tc_reported = 0;
+                fprintf(stderr, "{\"event\":\"transcode\",\"active\":0}\n");
             }
         }
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
