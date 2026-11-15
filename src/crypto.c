@@ -106,20 +106,25 @@ static void shift(uint8_t s[16], int inv) {
             t[r + 4 * c] = s[r + 4 * ((c + (inv ? 4 - r : r)) % 4)];
     memcpy(s, t, 16);
 }
+static uint8_t xtime(uint8_t value) {
+    return (uint8_t)((value << 1) ^ ((value & 0x80) ? 0x1b : 0));
+}
 static void mix(uint8_t s[16], int inv) {
     for (unsigned i = 0; i < 16; i += 4) {
         uint8_t a = s[i], b = s[i + 1], c = s[i + 2], d = s[i + 3];
         if (inv) {
-            s[i] = mul14[a] ^ mul11[b] ^ mul13[c] ^ mul9[d];
-            s[i + 1] = mul9[a] ^ mul14[b] ^ mul11[c] ^ mul13[d];
-            s[i + 2] = mul13[a] ^ mul9[b] ^ mul14[c] ^ mul11[d];
-            s[i + 3] = mul11[a] ^ mul13[b] ^ mul9[c] ^ mul14[d];
-        } else {
-            s[i] = mul2[a] ^ mul3[b] ^ c ^ d;
-            s[i + 1] = a ^ mul2[b] ^ mul3[c] ^ d;
-            s[i + 2] = a ^ b ^ mul2[c] ^ mul3[d];
-            s[i + 3] = mul3[a] ^ b ^ c ^ mul2[d];
+            const uint8_t ac = xtime(xtime(a ^ c));
+            const uint8_t bd = xtime(xtime(b ^ d));
+            a ^= ac;
+            c ^= ac;
+            b ^= bd;
+            d ^= bd;
         }
+        const uint8_t all = a ^ b ^ c ^ d;
+        s[i] = a ^ all ^ xtime(a ^ b);
+        s[i + 1] = b ^ all ^ xtime(b ^ c);
+        s[i + 2] = c ^ all ^ xtime(c ^ d);
+        s[i + 3] = d ^ all ^ xtime(d ^ a);
     }
 }
 void aes_encrypt(const aes128 *a, const uint8_t in[16], uint8_t out[16]) {

@@ -560,6 +560,7 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
         }
         int renewed = 0;
         if (dt295_renew_if_due(d, &renewed, error, sizeof(error))) {
+            fprintf(stderr, "DT295 renewal failed: %s\n", error);
             rc = 7;
             break;
         }
