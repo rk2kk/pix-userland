@@ -205,38 +205,48 @@ static uint32_t pmt_crc32(const uint8_t *p, size_t n) {
  * 0x000001B3 は MPEG-2 の sequence header。H.264 の SPS (NAL type 7) は
  * profile_idc が既知の値のときだけ本物とみなす (nal_ref_idc は除く)。 */
 static int video_is_h264(uint8_t *ts, size_t len, uint16_t video_pid, int *state) {
+    size_t total_cap = len;
+    uint8_t *buf = (uint8_t *)malloc(total_cap);
+    if (!buf)
+        return 0;
+    size_t buf_len = 0;
     for (size_t off = 0; off + 188 <= len; off += 188) {
         uint8_t *p = ts + off;
         if (p[0] != 0x47)
             continue;
         uint16_t pid = (uint16_t)(((p[1] & 0x1f) << 8) | p[2]);
-        if (pid != video_pid || !(p[1] & 0x40))
+        if (pid != video_pid)
             continue;
         int afc = (p[3] >> 4) & 3;
+        if (afc == 2 || afc == 0)
+            continue;
         size_t po = 4;
         if (afc & 2)
             po += 1 + p[4];
-        if (!(afc & 1) || po + 8 > 188)
+        if (po >= 188)
             continue;
-        uint8_t *d = p + po;
-        for (size_t i = 0; i + 4 < 188 - po; ++i) {
-            if (d[i] != 0 || d[i + 1] != 0 || d[i + 2] != 1)
-                continue;
-            uint8_t nal = d[i + 3];
-            if (nal == 0xb3) {
-                /* MPEG-2 の sequence header */
-                *state = 0;
-            } else if ((nal & 0x1f) == 7 && i + 5 < 188 - po) {
-                /* SPS。nal_ref_idc の bits は除く (実機は 0x27 = ref 1) */
-                uint8_t profile = d[i + 4];
-                if (profile == 66 || profile == 77 || profile == 88 || profile == 100 ||
-                    profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
-                    profile == 83 || profile == 86 || profile == 118 || profile == 128 ||
-                    profile == 138 || profile == 139 || profile == 134 || profile == 135)
-                    *state = 1;
-            }
+        size_t take = 188 - po;
+        if (buf_len + take > total_cap)
+            take = total_cap - buf_len;
+        memcpy(buf + buf_len, p + po, take);
+        buf_len += take;
+    }
+    for (size_t i = 0; i + 4 < buf_len; ++i) {
+        if (buf[i] != 0 || buf[i + 1] != 0 || buf[i + 2] != 1)
+            continue;
+        uint8_t nal = buf[i + 3];
+        if (nal == 0xb3) {
+            *state = 0;
+        } else if ((nal & 0x1f) == 7 && i + 5 < buf_len) {
+            uint8_t profile = buf[i + 4];
+            if (profile == 66 || profile == 77 || profile == 88 || profile == 100 ||
+                profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+                profile == 83 || profile == 86 || profile == 118 || profile == 128 ||
+                profile == 138 || profile == 139 || profile == 134 || profile == 135)
+                *state = 1;
         }
     }
+    free(buf);
     return *state;
 }
 
