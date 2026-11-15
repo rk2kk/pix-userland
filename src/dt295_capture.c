@@ -916,7 +916,6 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 ts_check_init(check);
             }
         }
-#ifndef DT295_CAPTURE_TESTING
         /* オンボード変換の確認と、実態に合わない PMT の書き換え。ルートの主
          * プログラムの映像が H.264 と宣言されているときだけ動く (変換中、
          * もしく元から H.264 の局)。passthrough の MPEG-2 には一切触れない。 */
@@ -952,9 +951,6 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                 fprintf(stderr, "{\"event\":\"transcode\",\"active\":0}\n");
             }
         }
-#else
-        (void)0;
-#endif
         if (emitted && (e = ts_output_submit(output, out, emitted, NULL))) {
             rc = output_exit(e);
             snprintf(error, sizeof(error), "TS enqueue: %s", strerror(e));
