@@ -487,7 +487,7 @@ static size_t ts_align_next(ts_align *a, const uint8_t *data, size_t total, size
 
 #endif
 int dt295_capture_run(const dt295_capture_config *cfg) {
-#if !defined(__APPLE__) && !defined(DT295_CAPTURE_TESTING)
+#if defined(__APPLE__)
     (void)cfg;
     fprintf(stderr, "DT295 capture currently supports macOS terrestrial target 0 only\n");
     return 2;
