@@ -712,6 +712,13 @@ int dt295_capture_run(const dt295_capture_config *cfg) {
                     rc = 7;
                     break;
                 }
+                /* Re-read selected_tsid after retune; otherwise PAT TSID check uses
+                 * the previous channel's value and falsely reports rc=8. */
+                if (next_system != PIXY_TERRESTRIAL &&
+                    dt295_satellite_status(d, &sat_state, error, sizeof(error))) {
+                    rc = 7;
+                    break;
+                }
                 e = dt295_stream_start(usb_native_context(u.usb), usb_native_handle(u.usb),
                                        &u.stream);
                 if (e) {
